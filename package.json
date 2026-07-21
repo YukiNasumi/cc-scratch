@@ -4,7 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start":"node src/code.ts"
+    "start":"node src/code.ts",
+    "debug":"DEBUG=true node src/code.ts"
   },
   "keywords": [],
   "author": "",
