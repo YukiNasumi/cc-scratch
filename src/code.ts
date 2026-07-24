@@ -1,41 +1,10 @@
-import {exec, type ExecException} from "node:child_process"
-import { promisify } from "node:util"
 import * as dotenv from 'dotenv'
 import Anthropic from '@anthropic-ai/sdk'
 import * as readline from 'node:readline/promises'
-import { stdout } from "node:process"
+import { persistHistory } from './utils/persistHistory.ts'
+import { runBash } from './utils/runBash.ts'
 
 dotenv.config({quiet:true})
-const execAsync = (command: string) =>
-  new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
-    exec(command, (err, stdout, stderr) => {
-      if (err) {
-        const execError: ExecException = err;
-        reject(execError);
-        return;
-      }
-
-      resolve({ stdout, stderr });
-    });
-  });
-
-async function runBash(command:string):Promise<string>{
-    const dangerous = ['rm',"shutdown"];
-    if(dangerous.some(d=>command.includes(d))){
-        return Promise.resolve("dangerous command denied");
-    }
-    try{
-        const {stdout,stderr} = await execAsync(command);
-        return stdout + '\n' + stderr;
-    } catch (err) {
-        const e = err as ExecException;
-        if (e.killed && e.signal === "SIGTERM") return "Error: Timeout (120s)";
-        // exec 在非零退出码时也 throw, 但 stdout/stderr 挂在 err 上 ——
-        // 和 Python subprocess.run(capture_output) 一样, 都要把输出喂给模型。
-        const out = ((e.stdout?.toString() ?? "") + (e.stderr?.toString() ?? "")).trim();
-        return out ? out.slice(0, 50_000) : `Error: ${e.message}`;
-    }
-}
 
 const client = new Anthropic({
     baseURL:process.env.ANTHROPIC_BASE_URL,
@@ -46,7 +15,24 @@ const SYSTEM = `You are a coding agent at ${process.cwd()}. Use bash to solve ta
 const DEBUG = process.argv.includes('--debug') || ['1', 'true'].includes(process.env.DEBUG?.toLowerCase() ?? '');
 
 const history:Anthropic.MessageParam[] = [];
+
+function persistAndExit(exitCode: number): never {
+    persistHistory(history);
+    rl.close();
+    process.exit(exitCode);
+}
+
 const rl = readline.createInterface({input:process.stdin,output:process.stdout});
+
+process.once('SIGINT', () => persistAndExit(130));
+process.once('uncaughtException', (error) => {
+    console.error(error);
+    persistAndExit(1);
+});
+process.once('unhandledRejection', (reason) => {
+    console.error('Unhandled promise rejection:', reason);
+    persistAndExit(1);
+});
 
 
 const TOOLS:Anthropic.Tool[] = [
@@ -74,8 +60,10 @@ while(true){
         break;
     }
     history.push({content:query,role:"user"});
+    persistHistory(history);
+    //agent loop
     while(true){
-        
+
         const rsp:Anthropic.Message = await client.messages.create({
             model:MODEL,
             system:SYSTEM,
@@ -86,14 +74,44 @@ while(true){
         
         let {content} = rsp;
         history.push({role:"assistant",content})
-        if(rsp.stop_reason&&rsp.stop_reason!=='tool_use'){
+        persistHistory(history);
+
+        let execRes = "";
+        //rsp includes tool use
+        for(const block of content){
+            if(block.type === 'thinking'){
+                console.log(`\x1b[34mthinking : ${block.thinking}\x1b[0m`);
+                continue;
+            }
+            if(block.type!=='tool_use'){
+                continue;
+            }
+
+            if(block.name === 'bash'){
+                let input = block.input as {command:string};
+                console.log(`\x1b[38;5;208mtool use : ${block.name} ${JSON.stringify(input)}\x1b[0m`);
+                let res = await runBash(input.command);
+                console.log(`\x1b[33m${res}\x1b[0m`);
+
+                execRes += res + "\n";
+            }
+
+        }
+        if(rsp.stop_reason!=='tool_use'){
             break;
         }
+        history.push({content:execRes,role:'user'});
+        persistHistory(history);
         if(DEBUG){
+            console.log("rsp")
             console.dir(rsp, {depth:null, maxArrayLength:null, maxStringLength:null});
         }
+    }
+    const content = history[history.length-1]?.content;
+    if(Array.isArray(content)){
         let output = content.filter((blk)=>blk.type === 'text').map(blk=>blk.text).join(" ").trim();
         console.log(output);
     }
 }
+persistHistory(history);
 rl.close();
